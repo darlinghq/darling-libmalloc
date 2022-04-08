@@ -47,12 +47,18 @@ static _malloc_lock_s _malloc_lock = _MALLOC_LOCK_INIT;
  */
 int32_t malloc_num_zones = 0;
 int32_t malloc_num_zones_allocated = 0;
-malloc_zone_t **malloc_zones = 0;
+malloc_zone_t **malloc_zones = (malloc_zone_t **)0xdeaddeaddeaddead;
 malloc_logger_t *malloc_logger = NULL;
+
+static uint32_t initial_num_zones;
+static malloc_zone_t *initial_scalable_zone;
+static malloc_zone_t *initial_nano_zone;
 static malloc_zone_t *initial_default_zone = NULL;
 
 unsigned malloc_debug_flags = 0;
-boolean_t malloc_tracing_enabled = false;
+bool malloc_tracing_enabled = false;
+bool malloc_space_efficient_enabled = false;
+bool malloc_medium_space_efficient_enabled = false;
 
 unsigned malloc_check_start = 0; // 0 means don't check
 unsigned malloc_check_counter = 0;
@@ -60,8 +66,6 @@ unsigned malloc_check_each = 1000;
 
 static int malloc_check_sleep = 100; // default 100 second sleep
 static int malloc_check_abort = 0;   // default is to sleep, not abort
-
-static os_once_t _malloc_initialize_pred;
 
 static
 struct msl {
@@ -118,6 +122,7 @@ static inline malloc_zone_t *inline_malloc_default_zone(void) __attribute__((alw
 #define DEFAULT_MALLOC_ZONE_STRING "DefaultMallocZone"
 #define DEFAULT_PUREGEABLE_ZONE_STRING "DefaultPurgeableMallocZone"
 #define MALLOC_HELPER_ZONE_STRING "MallocHelperZone"
+#define MALLOC_PGUARD_ZONE_STRING "ProbGuardMallocZone"
 
 MALLOC_NOEXPORT
 unsigned int phys_ncpus;
@@ -137,6 +142,7 @@ static const char large_expanded_cache_threshold_boot_arg[] = "malloc_large_expa
 static const char medium_enabled_boot_arg[] = "malloc_medium_zone";
 static const char max_medium_magazines_boot_arg[] = "malloc_max_medium_magazines";
 static const char medium_activation_threshold_boot_arg[] = "malloc_medium_activation_threshold";
+static const char medium_space_efficient_boot_arg[] = "malloc_medium_space_efficient";
 #endif // CONFIG_MEDIUM_ALLOCATOR
 
 /*********	Utilities	************/
@@ -156,6 +162,7 @@ static dlsym_t _dlsym = NULL;
 #endif // TARGET_OS_DRIVERKIT
 
 void __malloc_init(const char *apple[]);
+static void _malloc_initialize(const char *apple[], const char *bootargs);
 
 static int
 __entropy_from_kernel(const char *str)
@@ -185,6 +192,32 @@ __entropy_from_kernel(const char *str)
 		}
 	}
 	return idx;
+}
+
+#if TARGET_OS_OSX && defined(__x86_64__)
+static uint64_t
+__is_translated(void)
+{
+	return (*(uint64_t*)_COMM_PAGE_CPU_CAPABILITIES64) & kIsTranslated;
+}
+#endif /* TARGET_OS_OSX */
+
+
+#define LIBMALLOC_EXPERIMENT_FACTORS_KEY "MallocExperiment="
+#define LIBMALLOC_EXPERIMENT_DISABLE_MEDIUM (1ULL)
+static void
+__malloc_init_experiments(const char *str)
+{
+	uint64_t experiment_factors = 0;
+	str = strchr(str, '=');
+	if (str) {
+		experiment_factors = strtoull_l(str + 1, NULL, 16, NULL);
+	}
+	switch (experiment_factors) {
+	case LIBMALLOC_EXPERIMENT_DISABLE_MEDIUM:
+		magazine_medium_enabled = false;
+		break;
+	}
 }
 
 static void
@@ -223,6 +256,16 @@ __malloc_init_from_bootargs(const char *bootargs)
 	}
 
 #if CONFIG_MEDIUM_ALLOCATOR
+#if TARGET_OS_OSX
+#if defined(__x86_64__)
+	if (__is_translated()) {
+		magazine_medium_active_threshold = 0;
+	}
+#elif defined(__arm64__)
+	magazine_medium_active_threshold = 0;
+#endif
+#endif /* TARGET_OS_OSX */
+
 	flag = malloc_common_value_for_key_copy(bootargs, medium_enabled_boot_arg,
 			value_buf, sizeof(value_buf));
 	if (flag) {
@@ -258,10 +301,22 @@ __malloc_init_from_bootargs(const char *bootargs)
 					"malloc_max_medium_magazines must be positive - ignored.\n");
 		}
 	}
+
+	flag = malloc_common_value_for_key_copy(bootargs,
+			medium_space_efficient_boot_arg, value_buf, sizeof(value_buf));
+	if (flag) {
+		const char *endp;
+		long value = malloc_common_convert_to_long(flag, &endp);
+		if (!*endp) {
+			malloc_medium_space_efficient_enabled = (value != 0);
+		}
+	}
 #endif // CONFIG_MEDIUM_ALLOCATOR
 }
 
-/* TODO: Investigate adding _malloc_initialize() into this libSystem initializer */
+extern malloc_zone_t *force_asan_init_if_present(void)
+		asm("_malloc_default_zone");
+
 void
 __malloc_init(const char *apple[])
 {
@@ -270,18 +325,23 @@ __malloc_init(const char *apple[])
 	// to temporarily allocate at least a page of memory to read the bootargs
 	// into.
 	char bootargs[1024] = { '\0' };
+	bool allow_bootargs = true;
+#if CONFIG_FEATUREFLAGS_SIMPLE
+	allow_bootargs &= os_feature_enabled_simple(libmalloc, EnableBootArgs, false);
+#endif
+#if defined(_COMM_PAGE_DEV_FIRM)
+	allow_bootargs &= !!*((uint32_t *)_COMM_PAGE_DEV_FIRM);
+#endif // _COMM_PAGE_DEV_FIRM
+
 	size_t len = sizeof(bootargs) - 1;
-	if (!sysctlbyname("kern.bootargs", bootargs, &len, NULL, 0) && len > 0) {
+	if (allow_bootargs &&
+			!sysctlbyname("kern.bootargs", bootargs, &len, NULL, 0) &&
+			len > 0) {
 		bootargs[len + 1] = '\0';
 	}
 
-#if CONFIG_NANOZONE
-	// TODO: envp should be passed down from Libsystem
-	const char **envp = (const char **)*_NSGetEnviron();
-	nano_common_init(envp, apple, bootargs);
-#endif
-
 	const char **p;
+	const char *malloc_experiments = NULL;
 	for (p = apple; p && *p; p++) {
 		if (strstr(*p, "malloc_entropy") == *p) {
 			int count = __entropy_from_kernel(*p);
@@ -290,7 +350,9 @@ __malloc_init(const char *apple[])
 			if (sizeof(malloc_entropy) / sizeof(malloc_entropy[0]) == count) {
 				_malloc_entropy_initialized = true;
 			}
-			break;
+		}
+		if (strstr(*p, LIBMALLOC_EXPERIMENT_FACTORS_KEY) == *p) {
+			malloc_experiments = *p;
 		}
 	}
 	if (!_malloc_entropy_initialized) {
@@ -298,8 +360,36 @@ __malloc_init(const char *apple[])
 		_malloc_entropy_initialized = true;
 	}
 
+	if (malloc_experiments) {
+		__malloc_init_experiments(malloc_experiments);
+	}
 	__malloc_init_from_bootargs(bootargs);
 	mvm_aslr_init();
+
+	/*
+	 * This really is a renamed call to malloc_default_zone() which is
+	 * interposable and interposed by asan, so that we trigger the lazy
+	 * initialization of asan _BEFORE_ _malloc_initialize().
+	 *
+	 * If we do it after, then _malloc_initialize() then ASAN will replace
+	 * the system allocator too late and bad things happen.
+	 */
+	force_asan_init_if_present();
+
+	_malloc_initialize(apple, bootargs);
+}
+
+static void register_pgm_zone(bool internal_diagnostics);
+static void stack_logging_early_finished(const struct _malloc_late_init *funcs);
+
+// WARNING: The passed _malloc_late_init is a stack variable in
+// libSystem_initializer().  We must not hold on to it.
+void
+__malloc_late_init(const struct _malloc_late_init *mli)
+{
+	register_pgm_zone(mli->internal_diagnostics);
+	stack_logging_early_finished(mli);
+	initial_num_zones = malloc_num_zones;
 }
 
 MALLOC_NOEXPORT malloc_zone_t* lite_zone = NULL;
@@ -582,32 +672,37 @@ find_registered_zone(const void *ptr, size_t *returned_size)
 			return default_zone;
 		}
 	}
-	
-	// The default zone is registered in malloc_zones[0]. There's no danger that it will ever be unregistered.
-	// So don't advance the FRZ counter yet.
-	malloc_zone_t *zone = malloc_zones[0];
-	size_t size = zone->size(zone, ptr);
-	if (size) { // Claimed by this zone?
-		if (returned_size) {
-			*returned_size = size;
-		}
 
-		// Asan and others replace the zone at position 0 with their own zone.
-		// In that case just return that zone as they need this information.
-		// Otherwise return the virtual default zone, not the actual zone in position 0.
-		if (!has_default_zone0()) {
+	malloc_zone_t *zone;
+	size_t size;
+
+	// We assume that the initial zones will never be unregistered concurrently while this code is running so we can have
+	// a fast path without locking.  Callers who really do unregister these (to install their own default zone) need to
+	// ensure they establish their zone setup during initialization and before entering a multi-threaded environment.
+	for (uint32_t i = 0; i < initial_num_zones; i++) {
+		zone = malloc_zones[i];
+		size = zone->size(zone, ptr);
+
+		if (size) { // Claimed by this zone?
+			if (returned_size) {
+				*returned_size = size;
+			}
+
+			// Asan and others replace the zone at position 0 with their own zone.
+			// In that case just return that zone as they need this information.
+			// Otherwise return the virtual default zone, not the actual zone in position 0.
+			if (i == 0 && has_default_zone0()) {
+				return default_zone;
+			}
+
 			return zone;
-		} else {
-			return default_zone;
 		}
 	}
 
 	int32_t volatile *pFRZCounter = pFRZCounterLive;   // Capture pointer to the counter of the moment
 	OSAtomicIncrement32Barrier(pFRZCounter); // Advance this counter -- our thread is in FRZ
 
-	unsigned index;
 	int32_t limit = *(int32_t volatile *)&malloc_num_zones;
-	malloc_zone_t **zones = &malloc_zones[1];
 
 	// From this point on, FRZ is accessing the malloc_zones[] array without locking
 	// in order to avoid contention on common operations (such as non-default-zone free()).
@@ -624,8 +719,8 @@ find_registered_zone(const void *ptr, size_t *returned_size)
 	//      are still valid). It also ensures that all the pointers in the zones array are
 	//      valid until it returns, so that a stale value in limit is not dangerous.
 
-	for (index = 1; index < limit; ++index, ++zones) {
-		zone = *zones;
+	for (uint32_t i = initial_num_zones; i < limit; i++) {
+		zone = malloc_zones[i];
 		size = zone->size(zone, ptr);
 		if (size) { // Claimed by this zone?
 			goto out;
@@ -758,20 +853,14 @@ malloc_zone_register_while_locked(malloc_zone_t *zone)
 	// malloc_num_zones, protect_size);
 }
 
-// To be used in _malloc_initialize_once() only, call that function instead.
+// This used to be called lazyily because it is using
+// dyld_process_is_restricted() before dyld_init() has run.
+//
+// However this function is safe to use, we keep this function separate
+// if we ever need to have a 2-stage init in the future.
 static void
-_malloc_initialize(void *context __unused)
+_malloc_initialize(const char *apple[], const char *bootargs)
 {
-	MALLOC_LOCK();
-	unsigned n;
-	malloc_zone_t *zone = NULL;
-
-	if (!_malloc_entropy_initialized) {
-		// Lazy initialization may occur before __malloc_init (rdar://27075409)
-		// TODO: make this a fatal error
-		malloc_report(ASL_LEVEL_ERR, "*** malloc was initialized without entropy\n");
-	}
-
 	phys_ncpus = *(uint8_t *)(uintptr_t)_COMM_PAGE_PHYSICAL_CPUS;
 	logical_ncpus = *(uint8_t *)(uintptr_t)_COMM_PAGE_LOGICAL_CPUS;
 
@@ -811,70 +900,75 @@ _malloc_initialize(void *context __unused)
 	}
 
 	set_flags_from_environment(); // will only set flags up to two times
-	n = malloc_num_zones;
+
+#if CONFIG_NANOZONE
+	// TODO: envp should be passed down from Libsystem
+	const char **envp = (const char **)*_NSGetEnviron();
+	nano_common_init(envp, apple, bootargs);
+#endif
+
+	const uint32_t k_max_zones = 2;
+	malloc_zone_t *zone_stack[k_max_zones];
+	const char *name_stack[k_max_zones];
+	uint32_t num_zones = 0;
+
+	initial_scalable_zone = create_scalable_zone(0, malloc_debug_flags);
+	zone_stack[num_zones] = initial_scalable_zone;
+	name_stack[num_zones] = DEFAULT_MALLOC_ZONE_STRING;
+	num_zones++;
 
 #if CONFIG_NANOZONE
 	nano_common_configure();
-	
-	malloc_zone_t *helper_zone = create_scalable_zone(0, malloc_debug_flags);
+
+	malloc_zone_t *helper_zone = zone_stack[num_zones - 1];
+	malloc_zone_t *nano_zone = NULL;
 
 	if (_malloc_engaged_nano == NANO_V2) {
-		zone = nanov2_create_zone(helper_zone, malloc_debug_flags);
+		nano_zone = nanov2_create_zone(helper_zone, malloc_debug_flags);
 	} else if (_malloc_engaged_nano == NANO_V1) {
-		zone = nano_create_zone(helper_zone, malloc_debug_flags);
+		nano_zone = nano_create_zone(helper_zone, malloc_debug_flags);
 	}
 
-	if (zone) {
-		malloc_zone_register_while_locked(zone);
-		malloc_zone_register_while_locked(helper_zone);
-
-		// Must call malloc_set_zone_name() *after* helper and nano are hooked together.
-		malloc_set_zone_name(zone, DEFAULT_MALLOC_ZONE_STRING);
-		malloc_set_zone_name(helper_zone, MALLOC_HELPER_ZONE_STRING);
-	} else {
-		zone = helper_zone;
-		malloc_zone_register_while_locked(zone);
-		malloc_set_zone_name(zone, DEFAULT_MALLOC_ZONE_STRING);
+	if (nano_zone) {
+		initial_nano_zone = nano_zone;
+		zone_stack[num_zones] = nano_zone;
+		name_stack[num_zones] = DEFAULT_MALLOC_ZONE_STRING;
+		name_stack[num_zones - 1] = MALLOC_HELPER_ZONE_STRING;
+		num_zones++;
 	}
-#else
-	zone = create_scalable_zone(0, malloc_debug_flags);
-	malloc_zone_register_while_locked(zone);
-	malloc_set_zone_name(zone, DEFAULT_MALLOC_ZONE_STRING);
 #endif
 
-	initial_default_zone = zone;
+	MALLOC_ASSERT(num_zones <= k_max_zones);
+	initial_default_zone = zone_stack[num_zones - 1];
 
-	if (n != 0) { // make the default first, for efficiency
-		unsigned protect_size = malloc_num_zones_allocated * sizeof(malloc_zone_t *);
-		malloc_zone_t *hold = malloc_zones[0];
+	// 2 separate loops: malloc_set_zone_name already requires a working allocator.
+	for (int i = num_zones - 1; i >= 0; i--) malloc_zone_register_while_locked(zone_stack[i]);
+	for (int i = num_zones - 1; i >= 0; i--) malloc_set_zone_name(zone_stack[i], name_stack[i]);
 
-		if (hold->zone_name && strcmp(hold->zone_name, DEFAULT_MALLOC_ZONE_STRING) == 0) {
-			malloc_set_zone_name(hold, NULL);
-		}
-
-		mprotect(malloc_zones, protect_size, PROT_READ | PROT_WRITE);
-		malloc_zones[0] = malloc_zones[n];
-		malloc_zones[n] = hold;
-		mprotect(malloc_zones, protect_size, PROT_READ);
-	}
+	initial_num_zones = malloc_num_zones;
 
 	// malloc_report(ASL_LEVEL_INFO, "%d registered zones\n", malloc_num_zones);
 	// malloc_report(ASL_LEVEL_INFO, "malloc_zones is at %p; malloc_num_zones is at %p\n", (unsigned)&malloc_zones,
 	// (unsigned)&malloc_num_zones);
-	MALLOC_UNLOCK();
 }
 
-MALLOC_ALWAYS_INLINE
-static inline void
-_malloc_initialize_once(void)
+static void make_last_zone_default_zone(void);
+static void
+register_pgm_zone(bool internal_diagnostics)
 {
-	os_once(&_malloc_initialize_pred, NULL, _malloc_initialize);
+	if (pguard_enabled(internal_diagnostics)) {
+		malloc_zone_t *wrapped_zone = malloc_zones[0];
+		malloc_zone_t *pgm_zone = pguard_create_zone(wrapped_zone);
+		malloc_zone_register_while_locked(pgm_zone);
+		make_last_zone_default_zone();
+		initial_default_zone = pgm_zone;
+		malloc_set_zone_name(pgm_zone, MALLOC_PGUARD_ZONE_STRING);
+	}
 }
 
 static inline malloc_zone_t *
 inline_malloc_default_zone(void)
 {
-	_malloc_initialize_once();
 	// malloc_report(ASL_LEVEL_INFO, "In inline_malloc_default_zone with %d %d\n", malloc_num_zones, malloc_has_debug_zone);
 	return malloc_zones[0];
 }
@@ -883,41 +977,6 @@ malloc_zone_t *
 malloc_default_zone(void)
 {
 	return default_zone;
-}
-
-static inline malloc_zone_t *inline_malloc_default_scalable_zone(void) __attribute__((always_inline));
-static inline malloc_zone_t *
-inline_malloc_default_scalable_zone(void)
-{
-	unsigned index;
-
-	_malloc_initialize_once();
-	// malloc_report(ASL_LEVEL_INFO, "In inline_malloc_default_scalable_zone with %d %d\n", malloc_num_zones,
-	// malloc_has_debug_zone);
-
-	MALLOC_LOCK();
-#if CONFIG_NANOZONE
-	for (index = 0; index < malloc_num_zones; ++index) {
-		malloc_zone_t *z = malloc_zones[index];
-
-		if (z->zone_name && strcmp(z->zone_name, MALLOC_HELPER_ZONE_STRING) == 0) {
-			MALLOC_UNLOCK();
-			return z;
-		}
-	}
-#endif
-	for (index = 0; index < malloc_num_zones; ++index) {
-		malloc_zone_t *z = malloc_zones[index];
-
-		if (z->zone_name && strcmp(z->zone_name, DEFAULT_MALLOC_ZONE_STRING) == 0) {
-			MALLOC_UNLOCK();
-			return z;
-		}
-	}
-	MALLOC_UNLOCK();
-
-	malloc_report(ASL_LEVEL_ERR, "*** malloc_default_scalable_zone() failed to find 'DefaultMallocZone'\n");
-	return NULL; // FIXME: abort() instead?
 }
 
 static void *
@@ -980,7 +1039,7 @@ malloc_default_purgeable_zone(void)
 		// PR_7288598: Must pass a *scalable* zone (szone) as the helper for create_purgeable_zone().
 		// Take care that the zone so obtained is not subject to interposing.
 		//
-		malloc_zone_t *tmp = create_purgeable_zone(0, inline_malloc_default_scalable_zone(), malloc_debug_flags);
+		malloc_zone_t *tmp = create_purgeable_zone(0, initial_scalable_zone, malloc_debug_flags);
 		malloc_zone_register(tmp);
 		malloc_set_zone_name(tmp, DEFAULT_PUREGEABLE_ZONE_STRING);
 		if (!OSAtomicCompareAndSwapPtrBarrier(NULL, tmp, (void**)&dpz)) {
@@ -1008,6 +1067,7 @@ set_flags_from_environment(void)
 		malloc_debug_flags = MALLOC_ABORT_ON_CORRUPTION;
 	}
 #endif
+
 	/*
 	 * Given that all environment variables start with "Malloc" we optimize by scanning quickly
 	 * first the environment, therefore avoiding repeated calls to getenv().
@@ -1039,19 +1099,32 @@ set_flags_from_environment(void)
 		return;
 	}
 
-	if (getenv("MallocGuardEdges")) {
-		malloc_debug_flags |= MALLOC_ADD_GUARD_PAGES;
-		malloc_report(ASL_LEVEL_INFO, "protecting edges\n");
-		if (getenv("MallocDoNotProtectPrelude")) {
-			malloc_debug_flags |= MALLOC_DONT_PROTECT_PRELUDE;
-			malloc_report(ASL_LEVEL_INFO, "... but not protecting prelude guard page\n");
-		}
-		if (getenv("MallocDoNotProtectPostlude")) {
-			malloc_debug_flags |= MALLOC_DONT_PROTECT_POSTLUDE;
-			malloc_report(ASL_LEVEL_INFO, "... but not protecting postlude guard page\n");
+	flag = getenv("MallocGuardEdges");
+	if (flag) {
+		if (!strcmp(flag, "all")) {
+			// "MallocGuardEdges=all" adds guard page(s) for every region.
+			// Do not do this on 32-bit platforms because there is insufficient
+			// address space. These pages are always protected.
+#if MALLOC_TARGET_64BIT
+			malloc_debug_flags |= MALLOC_GUARD_ALL | MALLOC_ADD_GUARD_PAGE_FLAGS;
+			malloc_debug_flags &= ~(MALLOC_DONT_PROTECT_PRELUDE|MALLOC_DONT_PROTECT_POSTLUDE);
+			malloc_report(ASL_LEVEL_INFO, "adding guard pages to all regions\n");
+#endif // MALLOC_TARGET_64BIT
+		} else {
+			malloc_debug_flags |= MALLOC_ADD_GUARD_PAGE_FLAGS;
+			malloc_debug_flags &= ~MALLOC_GUARD_ALL;
+			malloc_report(ASL_LEVEL_INFO, "adding guard pages for large allocator blocks\n");
+			if (getenv("MallocDoNotProtectPrelude")) {
+				malloc_debug_flags |= MALLOC_DONT_PROTECT_PRELUDE;
+				malloc_report(ASL_LEVEL_INFO, "... but not protecting prelude guard page\n");
+			}
+			if (getenv("MallocDoNotProtectPostlude")) {
+				malloc_debug_flags |= MALLOC_DONT_PROTECT_POSTLUDE;
+				malloc_report(ASL_LEVEL_INFO, "... but not protecting postlude guard page\n");
+			}
 		}
 	}
-	
+
 	if (getenv("MallocScribble")) {
 		malloc_debug_flags |= MALLOC_DO_SCRIBBLE;
 		malloc_report(ASL_LEVEL_INFO, "enabling scribbling to detect mods to free blocks\n");
@@ -1149,6 +1222,40 @@ set_flags_from_environment(void)
 		}
 	}
 
+	flag = getenv("MallocLargeDisableASLR");
+	if (flag) {
+		uint64_t value = (uint64_t)strtoull(flag, NULL, 0);
+		if (value == 0) {
+			malloc_report(ASL_LEVEL_INFO, "Enabling ASLR slide on large allocations\n");
+			malloc_debug_flags &= ~DISABLE_LARGE_ASLR;
+		} else if (value != 0) {
+			malloc_report(ASL_LEVEL_INFO, "Disabling ASLR slide on large allocations\n");
+			malloc_debug_flags |= DISABLE_LARGE_ASLR;
+		}
+	}
+
+#if CONFIG_AGGRESSIVE_MADVISE || CONFIG_LARGE_CACHE
+	// convenience flag to configure policies usually associated with memory-constrained platforms (iOS)
+	// that trade some amount of time efficiency for space efficiency
+	flag = getenv("MallocSpaceEfficient");
+	if (flag) {
+		const char *endp;
+		long value = malloc_common_convert_to_long(flag, &endp);
+		if (!*endp && endp != flag && (value == 0 || value == 1)) {
+#if CONFIG_AGGRESSIVE_MADVISE
+			aggressive_madvise_enabled = (value == 1);
+#endif // CONFIG_AGGRESSIVE_MADVISE
+#if CONFIG_LARGE_CACHE
+			large_cache_enabled = (value == 0);
+#endif // CONFIG_LARGE_CACHE
+			malloc_space_efficient_enabled = (value == 1);
+			// consider disabling medium magazine if aggressive madvise is not sufficient
+		} else {
+			malloc_report(ASL_LEVEL_ERR, "MallocSpaceEfficient must be 0 or 1.\n");
+		}
+	}
+#endif // CONFIG_AGGRESSIVE_MADVISE || CONFIG_LARGE_CACHE
+
 #if CONFIG_MEDIUM_ALLOCATOR
 	flag = getenv("MallocMediumZone");
 	if (flag) {
@@ -1173,6 +1280,23 @@ set_flags_from_environment(void)
 		}
 	}
 
+	flag = getenv("MallocMediumSpaceEfficient");
+	if (flag) {
+		uint64_t value = (uint64_t)strtoull(flag, NULL, 0);
+		if (value == 0) {
+			malloc_medium_space_efficient_enabled = false;
+		} else if (value == 1) {
+			malloc_medium_space_efficient_enabled = true;
+		}
+	}
+
+	if (malloc_medium_space_efficient_enabled && malloc_space_efficient_enabled) {
+		// Bring down MallocMaxMediumMagazines to only a single magazine in
+		// space-efficent processes but do this before the envvar so that it
+		// can still be overridden at the command line.
+		max_medium_magazines = 1;
+	}
+
 	flag = getenv("MallocMaxMediumMagazines");
 #if RDAR_48993662
 	if (!flag) {
@@ -1194,6 +1318,32 @@ set_flags_from_environment(void)
 		}
 	}
 #endif // CONFIG_MEDIUM_ALLOCATOR
+
+#if CONFIG_AGGRESSIVE_MADVISE
+	flag = getenv("MallocAggressiveMadvise");
+	if (flag) {
+		const char *endp;
+		long value = malloc_common_convert_to_long(flag, &endp);
+		if (!*endp && endp != flag && (value == 0 || value == 1)) {
+			aggressive_madvise_enabled = (value == 1);
+		} else {
+			malloc_report(ASL_LEVEL_ERR, "MallocAggressiveMadvise must be 0 or 1.\n");
+		}
+	}
+#endif // CONFIG_AGGRESSIVE_MADVISE
+
+#if CONFIG_LARGE_CACHE
+	flag = getenv("MallocLargeCache");
+	if (flag) {
+		const char *endp;
+		long value = malloc_common_convert_to_long(flag, &endp);
+		if (!*endp && endp != flag && (value == 0 || value == 1)) {
+			large_cache_enabled = (value == 1);
+		} else {
+			malloc_report(ASL_LEVEL_ERR, "MallocLargeCache must be 0 or 1.\n");
+		}
+	}
+#endif // CONFIG_LARGE_CACHE
 
 #if CONFIG_RECIRC_DEPOT
 	flag = getenv("MallocRecircRetainedRegions");
@@ -1239,10 +1389,27 @@ malloc_create_zone(vm_size_t start_size, unsigned flags)
 	if (start_size > MALLOC_ABSOLUTE_MAX_SIZE) {
 		return NULL;
 	}
-	_malloc_initialize_once();
+
 	zone = create_scalable_zone(start_size, flags | malloc_debug_flags);
 	malloc_zone_register(zone);
 	return zone;
+}
+
+static void
+make_last_zone_default_zone(void)
+{
+	unsigned protect_size = malloc_num_zones_allocated * sizeof(malloc_zone_t *);
+	mprotect(malloc_zones, protect_size, PROT_READ | PROT_WRITE);
+
+	malloc_zone_t *last_zone = malloc_zones[malloc_num_zones - 1];
+
+	// assert(zone == malloc_zones[malloc_num_zones - 1];
+	for (int i = malloc_num_zones - 1; i > 0; --i) {
+		malloc_zones[i] = malloc_zones[i - 1];
+	}
+	malloc_zones[0] = last_zone;
+
+	mprotect(malloc_zones, protect_size, PROT_READ);
 }
 
 /*
@@ -1253,9 +1420,7 @@ void
 malloc_create_legacy_default_zone(void)
 {
 	malloc_zone_t *zone;
-	int i;
 
-	_malloc_initialize_once();
 	zone = create_legacy_scalable_zone(0, malloc_debug_flags);
 
 	MALLOC_LOCK();
@@ -1270,16 +1435,7 @@ malloc_create_legacy_default_zone(void)
 	}
 	malloc_set_zone_name(zone, DEFAULT_MALLOC_ZONE_STRING);
 
-	unsigned protect_size = malloc_num_zones_allocated * sizeof(malloc_zone_t *);
-	mprotect(malloc_zones, protect_size, PROT_READ | PROT_WRITE);
-
-	// assert(zone == malloc_zones[malloc_num_zones - 1];
-	for (i = malloc_num_zones - 1; i > 0; --i) {
-		malloc_zones[i] = malloc_zones[i - 1];
-	}
-	malloc_zones[0] = zone;
-
-	mprotect(malloc_zones, protect_size, PROT_READ);
+	make_last_zone_default_zone();
 	MALLOC_UNLOCK();
 }
 
@@ -1364,9 +1520,13 @@ malloc_zone_check_fail(const char *msg, const char *fmt, ...)
 
 /*********	Block creation and manipulation	************/
 
+__attribute__((cold, noinline))
 static void
 internal_check(void)
 {
+	if (malloc_check_counter++ < malloc_check_start) {
+		return;
+	}
 	if (malloc_zone_check(NULL)) {
 		if (!frames) {
 			vm_allocate(mach_task_self(), (void *)&frames, vm_page_size, 1);
@@ -1376,72 +1536,123 @@ internal_check(void)
 	malloc_check_start += malloc_check_each;
 }
 
-void *
-malloc_zone_malloc(malloc_zone_t *zone, size_t size)
+__options_decl(malloc_zone_options_t, unsigned, {
+	MZ_NONE  = 0x0,
+	MZ_POSIX = 0x1,
+	MZ_C11   = 0x2,
+});
+
+static inline void
+malloc_set_errno_fast(malloc_zone_options_t mzo, int err)
+{
+	if (mzo & MZ_POSIX) {
+#if TARGET_OS_SIMULATOR
+		errno = err;
+#else
+		(*_pthread_errno_address_direct()) = err;
+#endif
+	}
+}
+
+MALLOC_NOINLINE
+static void *
+_malloc_zone_malloc(malloc_zone_t *zone, size_t size, malloc_zone_options_t mzo)
 {
 	MALLOC_TRACE(TRACE_malloc | DBG_FUNC_START, (uintptr_t)zone, size, 0, 0);
 
-	void *ptr;
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
+	void *ptr = NULL;
+
+	if (malloc_check_start) {
 		internal_check();
 	}
 	if (size > MALLOC_ABSOLUTE_MAX_SIZE) {
-		return NULL;
+		goto out;
 	}
 
 	ptr = zone->malloc(zone, size);		// if lite zone is passed in then we still call the lite methods
 
-	
-	if (malloc_logger) {
+	if (os_unlikely(malloc_logger)) {
 		malloc_logger(MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE, (uintptr_t)zone, (uintptr_t)size, 0, (uintptr_t)ptr, 0);
 	}
 
 	MALLOC_TRACE(TRACE_malloc | DBG_FUNC_END, (uintptr_t)zone, size, (uintptr_t)ptr, 0);
+out:
+	if (os_unlikely(ptr == NULL)) {
+		malloc_set_errno_fast(mzo, ENOMEM);
+	}
+	return ptr;
+}
+
+void *
+malloc_zone_malloc(malloc_zone_t *zone, size_t size)
+{
+	return _malloc_zone_malloc(zone, size, MZ_NONE);
+}
+
+MALLOC_NOINLINE
+static void *
+_malloc_zone_calloc(malloc_zone_t *zone, size_t num_items, size_t size,
+		malloc_zone_options_t mzo)
+{
+	MALLOC_TRACE(TRACE_calloc | DBG_FUNC_START, (uintptr_t)zone, num_items, size, 0);
+
+	void *ptr;
+	if (malloc_check_start) {
+		internal_check();
+	}
+
+	ptr = zone->calloc(zone, num_items, size);
+
+	if (os_unlikely(malloc_logger)) {
+		malloc_logger(MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE | MALLOC_LOG_TYPE_CLEARED, (uintptr_t)zone,
+				(uintptr_t)(num_items * size), 0, (uintptr_t)ptr, 0);
+	}
+
+	MALLOC_TRACE(TRACE_calloc | DBG_FUNC_END, (uintptr_t)zone, num_items, size, (uintptr_t)ptr);
+	if (os_unlikely(ptr == NULL)) {
+		malloc_set_errno_fast(mzo, ENOMEM);
+	}
 	return ptr;
 }
 
 void *
 malloc_zone_calloc(malloc_zone_t *zone, size_t num_items, size_t size)
 {
-	MALLOC_TRACE(TRACE_calloc | DBG_FUNC_START, (uintptr_t)zone, num_items, size, 0);
+	return _malloc_zone_calloc(zone, num_items, size, MZ_NONE);
+}
 
-	void *ptr;
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
+MALLOC_NOINLINE
+static void *
+_malloc_zone_valloc(malloc_zone_t *zone, size_t size, malloc_zone_options_t mzo)
+{
+	MALLOC_TRACE(TRACE_valloc | DBG_FUNC_START, (uintptr_t)zone, size, 0, 0);
+
+	void *ptr = NULL;
+	if (malloc_check_start) {
 		internal_check();
 	}
-
-	ptr = zone->calloc(zone, num_items, size);
-	
-	if (malloc_logger) {
-		malloc_logger(MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE | MALLOC_LOG_TYPE_CLEARED, (uintptr_t)zone,
-				(uintptr_t)(num_items * size), 0, (uintptr_t)ptr, 0);
+	if (size > MALLOC_ABSOLUTE_MAX_SIZE) {
+		goto out;
 	}
 
-	MALLOC_TRACE(TRACE_calloc | DBG_FUNC_END, (uintptr_t)zone, num_items, size, (uintptr_t)ptr);
+	ptr = zone->valloc(zone, size);
+
+	if (os_unlikely(malloc_logger)) {
+		malloc_logger(MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE, (uintptr_t)zone, (uintptr_t)size, 0, (uintptr_t)ptr, 0);
+	}
+
+	MALLOC_TRACE(TRACE_valloc | DBG_FUNC_END, (uintptr_t)zone, size, (uintptr_t)ptr, 0);
+out:
+	if (os_unlikely(ptr == NULL)) {
+		malloc_set_errno_fast(mzo, ENOMEM);
+	}
 	return ptr;
 }
 
 void *
 malloc_zone_valloc(malloc_zone_t *zone, size_t size)
 {
-	MALLOC_TRACE(TRACE_valloc | DBG_FUNC_START, (uintptr_t)zone, size, 0, 0);
-
-	void *ptr;
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
-		internal_check();
-	}
-	if (size > MALLOC_ABSOLUTE_MAX_SIZE) {
-		return NULL;
-	}
-
-	ptr = zone->valloc(zone, size);
-	
-	if (malloc_logger) {
-		malloc_logger(MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE, (uintptr_t)zone, (uintptr_t)size, 0, (uintptr_t)ptr, 0);
-	}
-
-	MALLOC_TRACE(TRACE_valloc | DBG_FUNC_END, (uintptr_t)zone, size, (uintptr_t)ptr, 0);
-	return ptr;
+	return _malloc_zone_valloc(zone, size, MZ_NONE);
 }
 
 void *
@@ -1450,7 +1661,7 @@ malloc_zone_realloc(malloc_zone_t *zone, void *ptr, size_t size)
 	MALLOC_TRACE(TRACE_realloc | DBG_FUNC_START, (uintptr_t)zone, (uintptr_t)ptr, size, 0);
 
 	void *new_ptr;
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
+	if (malloc_check_start) {
 		internal_check();
 	}
 	if (size > MALLOC_ABSOLUTE_MAX_SIZE) {
@@ -1459,7 +1670,7 @@ malloc_zone_realloc(malloc_zone_t *zone, void *ptr, size_t size)
 
 	new_ptr = zone->realloc(zone, ptr, size);
 	
-	if (malloc_logger) {
+	if (os_unlikely(malloc_logger)) {
 		malloc_logger(MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_DEALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE, (uintptr_t)zone,
 				(uintptr_t)ptr, (uintptr_t)size, (uintptr_t)new_ptr, 0);
 	}
@@ -1472,10 +1683,10 @@ malloc_zone_free(malloc_zone_t *zone, void *ptr)
 {
 	MALLOC_TRACE(TRACE_free, (uintptr_t)zone, (uintptr_t)ptr, (ptr) ? *(uintptr_t*)ptr : 0, 0);
 
-	if (malloc_logger) {
+	if (os_unlikely(malloc_logger)) {
 		malloc_logger(MALLOC_LOG_TYPE_DEALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE, (uintptr_t)zone, (uintptr_t)ptr, 0, 0, 0);
 	}
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
+	if (malloc_check_start) {
 		internal_check();
 	}
 
@@ -1487,10 +1698,10 @@ malloc_zone_free_definite_size(malloc_zone_t *zone, void *ptr, size_t size)
 {
 	MALLOC_TRACE(TRACE_free, (uintptr_t)zone, (uintptr_t)ptr, size, (ptr && size) ? *(uintptr_t*)ptr : 0);
 
-	if (malloc_logger) {
+	if (os_unlikely(malloc_logger)) {
 		malloc_logger(MALLOC_LOG_TYPE_DEALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE, (uintptr_t)zone, (uintptr_t)ptr, 0, 0, 0);
 	}
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
+	if (malloc_check_start) {
 		internal_check();
 	}
 
@@ -1507,37 +1718,58 @@ malloc_zone_from_ptr(const void *ptr)
 	}
 }
 
-void *
-malloc_zone_memalign(malloc_zone_t *zone, size_t alignment, size_t size)
+MALLOC_NOINLINE
+static void *
+_malloc_zone_memalign(malloc_zone_t *zone, size_t alignment, size_t size,
+		malloc_zone_options_t mzo)
 {
 	MALLOC_TRACE(TRACE_memalign | DBG_FUNC_START, (uintptr_t)zone, alignment, size, 0);
 
-	void *ptr;
+	void *ptr = NULL;
+	int err = ENOMEM;
 	if (zone->version < 5) { // Version must be >= 5 to look at the new memalign field.
-		return NULL;
+		goto out;
 	}
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
+	if (malloc_check_start) {
 		internal_check();
 	}
 	if (size > MALLOC_ABSOLUTE_MAX_SIZE) {
-		return NULL;
+		goto out;
 	}
 	if (alignment < sizeof(void *) ||			  // excludes 0 == alignment
 			0 != (alignment & (alignment - 1))) { // relies on sizeof(void *) being a power of two.
-		return NULL;
+		err = EINVAL;
+		goto out;
+	}
+	if ((mzo & MZ_C11) && (size & (alignment - 1)) != 0) { /* C11 requires size to be a multiple of alignment */
+		err = EINVAL;
+		goto out;
 	}
 
 	if (!(zone->memalign)) {
-		return NULL;
+		goto out;
 	}
 	ptr = zone->memalign(zone, alignment, size);
 
-	if (malloc_logger) {
+	if (os_unlikely(malloc_logger)) {
 		malloc_logger(MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE, (uintptr_t)zone, (uintptr_t)size, 0, (uintptr_t)ptr, 0);
 	}
 
 	MALLOC_TRACE(TRACE_memalign | DBG_FUNC_END, (uintptr_t)zone, alignment, size, (uintptr_t)ptr);
+
+out:
+	if (os_unlikely(ptr == NULL)) {
+		if (mzo & MZ_POSIX) {
+			malloc_set_errno_fast(mzo, err);
+		}
+	}
 	return ptr;
+}
+
+void *
+malloc_zone_memalign(malloc_zone_t *zone, size_t alignment, size_t size)
+{
+	return _malloc_zone_memalign(zone, alignment, size, MZ_NONE);
 }
 
 boolean_t
@@ -1548,7 +1780,7 @@ malloc_zone_claimed_address(malloc_zone_t *zone, void *ptr)
 		return false;
 	}
 
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
+	if (malloc_check_start) {
 		internal_check();
 	}
 
@@ -1599,6 +1831,10 @@ malloc_zone_unregister(malloc_zone_t *z)
 
 		mprotect(malloc_zones, protect_size, PROT_READ);
 
+		// MAX(num_zones, 1) enables the fast path in find_registered_zone() for zone 0 even
+		// if it is a custom zone, e.g., ASan and user zones.
+		initial_num_zones = MIN(MAX(malloc_num_zones, 1), initial_num_zones);
+
 		// Exchange the roles of the FRZ counters. The counter that has captured the number of threads presently
 		// executing *inside* find_registered_zone is swapped with the counter drained to zero last time through.
 		// The former is then allowed to drain to zero while this thread yields.
@@ -1631,7 +1867,7 @@ malloc_set_zone_name(malloc_zone_t *z, const char *name)
 	}
 	if (name) {
 		size_t buflen = strlen(name) + 1;
-		newName = malloc_zone_malloc(z, buflen);
+		newName = _malloc_zone_malloc(z, buflen, MZ_NONE);
 		if (newName) {
 			strlcpy(newName, name, buflen);
 			z->zone_name = (const char *)newName;
@@ -1654,39 +1890,20 @@ malloc_get_zone_name(malloc_zone_t *zone)
 void *
 malloc(size_t size)
 {
-	void *retval;
-	retval = malloc_zone_malloc(default_zone, size);
-	if (retval == NULL) {
-		errno = ENOMEM;
-	}
-	return retval;
+	return _malloc_zone_malloc(default_zone, size, MZ_POSIX);
 }
 
 void *
 aligned_alloc(size_t alignment, size_t size)
 {
-	if (alignment < sizeof(void *) || !powerof2(alignment) || /* those are implementation requirements */
-			(size & (alignment - 1)) != 0) { /* C11 requires size to be a multiple of alignment */
-		errno = EINVAL;
-		return NULL;
-	}
-
-	void *retval = malloc_zone_memalign(default_zone, alignment, size);
-	if (retval == NULL) {
-		errno = ENOMEM;
-	}
-	return retval;
+	return _malloc_zone_memalign(default_zone, alignment, size,
+	    MZ_POSIX | MZ_C11);
 }
 
 void *
 calloc(size_t num_items, size_t size)
 {
-	void *retval;
-	retval = malloc_zone_calloc(default_zone, num_items, size);
-	if (retval == NULL) {
-		errno = ENOMEM;
-	}
-	return retval;
+	return _malloc_zone_calloc(default_zone, num_items, size, MZ_POSIX);
 }
 
 void
@@ -1745,7 +1962,7 @@ realloc(void *in_ptr, size_t new_size)
 	}
 
 	if (retval == NULL) {
-		errno = ENOMEM;
+		malloc_set_errno_fast(MZ_POSIX, ENOMEM);
 	} else if (new_size == 0) {
 		free(in_ptr);
 	}
@@ -1755,13 +1972,7 @@ realloc(void *in_ptr, size_t new_size)
 void *
 valloc(size_t size)
 {
-	void *retval;
-	malloc_zone_t *zone = default_zone;
-	retval = malloc_zone_valloc(zone, size);
-	if (retval == NULL) {
-		errno = ENOMEM;
-	}
-	return retval;
+	return _malloc_zone_valloc(default_zone, size, MZ_POSIX);
 }
 
 extern void
@@ -1844,9 +2055,11 @@ malloc_claimed_address(void *ptr)
 		return true;
 	}
 
-	// Next, try the default zone, which is always present.
-	if (malloc_zone_claimed_address(malloc_zones[0], ptr)) {
-		return true;
+	// Next, try the initial zones.
+	for (uint32_t i = 0; i < initial_num_zones; i++) {
+		if (malloc_zone_claimed_address(malloc_zones[i], ptr)) {
+			return true;
+		}
 	}
 
 	// Try all the other zones. Increment the FRZ barrier so that we can
@@ -1856,10 +2069,9 @@ malloc_claimed_address(void *ptr)
 	OSAtomicIncrement32Barrier(pFRZCounter);
 
 	int32_t limit = *(int32_t volatile *)&malloc_num_zones;
-	malloc_zone_t **zones = &malloc_zones[1];
 	boolean_t result = false;
-	for (unsigned index = 1; index < limit; ++index, ++zones) {
-		malloc_zone_t *zone = *zones;
+	for (uint32_t i = initial_num_zones; i < limit; i++) {
+		malloc_zone_t *zone = malloc_zones[i];
 		if (malloc_zone_claimed_address(zone, ptr)) {
 			result = true;
 			break;
@@ -1874,7 +2086,7 @@ void *
 reallocarray(void * in_ptr, size_t nmemb, size_t size){
 	size_t alloc_size;
 	if (os_mul_overflow(nmemb, size, &alloc_size)){
-		errno = ENOMEM;
+		malloc_set_errno_fast(MZ_POSIX, ENOMEM);
 		return NULL;
 	}
 	return realloc(in_ptr, alloc_size);
@@ -1884,7 +2096,7 @@ void *
 reallocarrayf(void * in_ptr, size_t nmemb, size_t size){
 	size_t alloc_size;
 	if (os_mul_overflow(nmemb, size, &alloc_size)){
-		errno = ENOMEM;
+		malloc_set_errno_fast(MZ_POSIX, ENOMEM);
 		return NULL;
 	}
 	return reallocf(in_ptr, alloc_size);
@@ -2032,12 +2244,12 @@ malloc_zone_batch_malloc(malloc_zone_t *zone, size_t size, void **results, unsig
 	if (!zone->batch_malloc) {
 		return 0;
 	}
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
+	if (malloc_check_start) {
 		internal_check();
 	}
 	unsigned batched = zone->batch_malloc(zone, size, results, num_requested);
 	
-	if (malloc_logger) {
+	if (os_unlikely(malloc_logger)) {
 		unsigned index = 0;
 		while (index < batched) {
 			malloc_logger(MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_HAS_ZONE, (uintptr_t)zone, (uintptr_t)size, 0,
@@ -2051,10 +2263,10 @@ malloc_zone_batch_malloc(malloc_zone_t *zone, size_t size, void **results, unsig
 void
 malloc_zone_batch_free(malloc_zone_t *zone, void **to_be_freed, unsigned num)
 {
-	if (malloc_check_start && (malloc_check_counter++ >= malloc_check_start)) {
+	if (malloc_check_start) {
 		internal_check();
 	}
-	if (malloc_logger) {
+	if (os_unlikely(malloc_logger)) {
 		unsigned index = 0;
 		while (index < num) {
 			malloc_logger(
@@ -2306,11 +2518,11 @@ void
 _malloc_fork_child(void)
 {
 #if CONFIG_NANOZONE
-	if (_malloc_initialize_pred) {
+	if (_malloc_entropy_initialized) {
 		if (_malloc_engaged_nano == NANO_V2) {
-			nanov2_forked_zone((nanozonev2_t *)inline_malloc_default_zone());
+			nanov2_forked_zone((nanozonev2_t *)initial_nano_zone);
 		} else if (_malloc_engaged_nano == NANO_V1) {
-			nano_forked_zone((nanozone_t *)inline_malloc_default_zone());
+			nano_forked_zone((nanozone_t *)initial_nano_zone);
 		}
 	}
 #endif
@@ -2448,8 +2660,8 @@ malloc_debug(int level)
 
 
 /* this is called from libsystem during initialization. */
-void
-__stack_logging_early_finished(const struct _malloc_functions *funcs)
+static void
+stack_logging_early_finished(const struct _malloc_late_init *funcs)
 {
 #if !TARGET_OS_DRIVERKIT
 	_dlopen = funcs->dlopen;
@@ -2511,9 +2723,9 @@ malloc_register_stack_logger(void)
 	if (msl.dylib != NULL) {
 		return true;
 	}
-	void *dylib = _dlopen("/System/Library/PrivateFrameworks/Alternate/MallocStackLogging.framework/MallocStackLogging", RTLD_GLOBAL);
+	void *dylib = _dlopen("/System/Library/PrivateFrameworks/MallocStackLogging.framework/MallocStackLogging", RTLD_GLOBAL);
 	if (dylib == NULL) {
-		dylib = _dlopen("/System/Library/PrivateFrameworks/MallocStackLogging.framework/MallocStackLogging", RTLD_GLOBAL);
+		return false;	
 	}
 	os_once(&_register_msl_dylib_pred, dylib, register_msl_dylib);
 	if (!msl.dylib) {
