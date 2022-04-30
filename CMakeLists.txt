@@ -25,6 +25,7 @@ set(libmalloc_sources
 	src/magazine_tiny.c
 	src/malloc.c
 	src/nano_malloc.c
+	src/pguard_malloc.c
 	src/purgeable_malloc.c
 	src/magazine_medium.c
 	src/magazine_rack.c
