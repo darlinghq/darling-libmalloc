@@ -124,13 +124,13 @@ medium_mag_get_thread_index(void)
 {
 #if CONFIG_MEDIUM_USES_HYPER_SHIFT
 	if (os_likely(_os_cpu_number_override == -1)) {
-		return _os_cpu_number() >> hyper_shift;
+		return _malloc_cpu_number() >> hyper_shift;
 	} else {
 		return _os_cpu_number_override >> hyper_shift;
 	}
 #else // CONFIG_MEDIUM_USES_HYPER_SHIFT
 	if (os_likely(_os_cpu_number_override == -1)) {
-		return _os_cpu_number();
+		return _malloc_cpu_number();
 	} else {
 		return _os_cpu_number_override;
 	}
@@ -312,7 +312,7 @@ medium_oob_free_entry_get_ptr_task(task_t task, memory_reader_t reader,
 static MALLOC_INLINE void
 medium_oob_free_entry_set_ptr(oob_free_entry_t oobe, void *ptr)
 {
-	oobe->ptr = MEDIUM_IS_OOB | (MEDIUM_OFFSET_FOR_PTR(ptr) >> SHIFT_MEDIUM_QUANTUM);
+	oobe->ptr = MEDIUM_IS_OOB | (MEDIUM_REGION_OFFSET_FOR_PTR(ptr) >> SHIFT_MEDIUM_QUANTUM);
 }
 
 static MALLOC_INLINE void
@@ -712,7 +712,7 @@ medium_finalize_region(rack_t *rack, magazine_t *medium_mag_ptr)
 	//        than performing this workaround.
 	//
 	if (medium_mag_ptr->mag_bytes_free_at_end) {
-		last_block = MEDIUM_REGION_END(medium_mag_ptr->mag_last_region) - medium_mag_ptr->mag_bytes_free_at_end;
+		last_block = MEDIUM_REGION_HEAP_END(medium_mag_ptr->mag_last_region) - medium_mag_ptr->mag_bytes_free_at_end;
 		last_msize = MEDIUM_MSIZE_FOR_BYTES(medium_mag_ptr->mag_bytes_free_at_end);
 
 		last_index = MEDIUM_META_INDEX_FOR_PTR(last_block);
@@ -762,12 +762,11 @@ medium_finalize_region(rack_t *rack, magazine_t *medium_mag_ptr)
 int
 medium_free_detach_region(rack_t *rack, magazine_t *medium_mag_ptr, region_t r)
 {
-	unsigned char *ptr = MEDIUM_REGION_ADDRESS(r);
-	msize_t *meta_headers = MEDIUM_META_HEADER_FOR_PTR(ptr);
-	uintptr_t start = (uintptr_t)MEDIUM_REGION_ADDRESS(r);
+	uintptr_t start = (uintptr_t)MEDIUM_REGION_HEAP_BASE(r);
 	uintptr_t current = start;
-	uintptr_t limit = (uintptr_t)MEDIUM_REGION_END(r);
+	uintptr_t limit = (uintptr_t)MEDIUM_REGION_HEAP_END(r);
 	int total_alloc = 0;
+	msize_t *meta_headers = MEDIUM_META_HEADER_FOR_PTR(start);
 
 	while (current < limit) {
 		unsigned index = MEDIUM_META_INDEX_FOR_PTR(current);
@@ -797,12 +796,11 @@ medium_free_detach_region(rack_t *rack, magazine_t *medium_mag_ptr, region_t r)
 size_t
 medium_free_reattach_region(rack_t *rack, magazine_t *medium_mag_ptr, region_t r)
 {
-	unsigned char *ptr = MEDIUM_REGION_ADDRESS(r);
-	msize_t *meta_headers = MEDIUM_META_HEADER_FOR_PTR(ptr);
-	uintptr_t start = (uintptr_t)MEDIUM_REGION_ADDRESS(r);
+	uintptr_t start = (uintptr_t)MEDIUM_REGION_HEAP_BASE(r);
 	uintptr_t current = start;
-	uintptr_t limit = (uintptr_t)MEDIUM_REGION_END(r);
+	uintptr_t limit = (uintptr_t)MEDIUM_REGION_HEAP_END(r);
 	size_t total_alloc = 0;
+	msize_t *meta_headers = MEDIUM_META_HEADER_FOR_PTR(start);
 
 	while (current < limit) {
 		unsigned index = MEDIUM_META_INDEX_FOR_PTR(current);
@@ -834,9 +832,9 @@ typedef struct _medium_advisory_s {
 void
 medium_free_scan_madvise_free(rack_t *rack, magazine_t *depot_ptr, region_t r)
 {
-	uintptr_t start = (uintptr_t)MEDIUM_REGION_ADDRESS(r);
+	uintptr_t start = (uintptr_t)MEDIUM_REGION_HEAP_BASE(r);
 	uintptr_t current = start;
-	uintptr_t limit = (uintptr_t)MEDIUM_REGION_END(r);
+	uintptr_t limit = (uintptr_t)MEDIUM_REGION_HEAP_END(r);
 	msize_t *meta_headers = MEDIUM_META_HEADER_FOR_PTR(start);
 	msize_t *madv_headers = MEDIUM_MADVISE_HEADER_FOR_PTR(start);
 
@@ -868,6 +866,7 @@ medium_free_scan_madvise_free(rack_t *rack, magazine_t *depot_ptr, region_t r)
 				medium_advisory_t mat = (medium_advisory_t)pgLo;
 				mat->next = advisories;
 				mat->size = pgHi - pgLo;
+				advisories = mat;
 			}
 			break;
 		}
@@ -895,6 +894,7 @@ medium_free_scan_madvise_free(rack_t *rack, magazine_t *depot_ptr, region_t r)
 					medium_advisory_t mat = (medium_advisory_t)pgLo;
 					mat->next = advisories;
 					mat->size = pgHi - pgLo;
+					advisories = mat;
 				}
 
 				memset(&madv_headers[index], 0, sizeof(uint16_t) * alloc_msize);
@@ -1072,19 +1072,31 @@ medium_madvise_pressure_relief(rack_t *rack)
 	for (mag_index = 0; mag_index < rack->num_magazines; mag_index++) {
 		size_t index;
 		for (index = 0; index < rack->region_generation->num_regions_allocated; ++index) {
-			SZONE_LOCK(MEDIUM_SZONE_FROM_RACK(rack));
+			rack_region_lock(rack);
 
 			region_t medium = rack->region_generation->hashed_regions[index];
 			if (!medium || medium == HASHRING_REGION_DEALLOCATED) {
-				SZONE_UNLOCK(MEDIUM_SZONE_FROM_RACK(rack));
+				rack_region_unlock(rack);
 				continue;
 			}
 
-			magazine_t *mag_ptr = mag_lock_zine_for_region_trailer(rack->magazines,
-					REGION_TRAILER_FOR_MEDIUM_REGION(medium),
-					MAGAZINE_INDEX_FOR_MEDIUM_REGION(medium));
+			region_trailer_t *trailer =
+					REGION_TRAILER_FOR_MEDIUM_REGION(medium);
+			// Make sure that the owning magazine doesn't try and take this out
+			// from under our feet.
+			trailer->dispose_flags |= RACK_DISPOSE_DELAY;
+			rack_region_unlock(rack);
 
-			SZONE_UNLOCK(MEDIUM_SZONE_FROM_RACK(rack));
+			magazine_t *mag_ptr = mag_lock_zine_for_region_trailer(rack->magazines,
+					trailer, MAGAZINE_INDEX_FOR_MEDIUM_REGION(medium));
+
+			// If acquiring the region lock was enough to prevent the owning
+			// magazine from deallocating the region, free it now so we don't
+			// do wasted work.
+			if (rack_region_maybe_dispose(rack, medium, MEDIUM_REGION_SIZE, trailer)) {
+				SZONE_MAGAZINE_PTR_UNLOCK(mag_ptr);
+				continue;
+			}
 
 			/* Ordering is important here, the magazine of a region may potentially change
 			 * during mag_lock_zine_for_region_trailer, so src_mag_index must be taken
@@ -1158,7 +1170,6 @@ medium_madvise_free_range_conditional_no_lock(rack_t *rack, magazine_t *mag_ptr,
 {
 	region_trailer_t *node = REGION_TRAILER_FOR_MEDIUM_REGION(region);
 	msize_t *madvh = MEDIUM_MADVISE_HEADER_FOR_PTR(ptr);
-
 	msize_t trigger_msize = trigger_level >> SHIFT_MEDIUM_QUANTUM;
 
 	size_t free_header_size = sizeof(medium_inplace_free_entry_s) + sizeof(msize_t);
@@ -1207,7 +1218,7 @@ medium_madvise_free_range_conditional_no_lock(rack_t *rack, magazine_t *mag_ptr,
 	}
 
 	msize_t right_dirty_msz = 0;
-	if (right_end_idx < src_end_idx) {
+	if (right_end_idx > src_end_idx) {
 		// Same as above, if we had trailing data coalesced with this entry
 		// and that was not madvised, consider it, too.
 		right_dirty_msz = medium_madvise_header_dirty_len(madvh, right_start_idx);
@@ -1220,7 +1231,7 @@ medium_madvise_free_range_conditional_no_lock(rack_t *rack, magazine_t *mag_ptr,
 		medium_madvise_header_mark_middle(madvh, right_end_idx);
 	}
 
-	// We absolutely can't madvise lower the the free-list entry pointer plus
+	// We absolutely can't madvise lower than the free-list entry pointer plus
 	// the header size. When the entry is OOB, there's no header or footer to
 	// store in memory.
 	uintptr_t safe_start_ptr = round_page_kernel(rangep + free_header_size);
@@ -1231,20 +1242,22 @@ medium_madvise_free_range_conditional_no_lock(rack_t *rack, magazine_t *mag_ptr,
 	// bound it by the safe_start/end pointers to make sure we don't clobber
 	// the free-list.
 	if ((vote_force == 2) || (dirty_msz >= trigger_msize)) {
-		uintptr_t lo = MAX(MEDIUM_PTR_FOR_META_INDEX(region, range_idx),
+		uintptr_t lo = MAX((uintptr_t)MEDIUM_PTR_FOR_META_INDEX(region, range_idx),
 				safe_start_ptr);
-		uintptr_t hi = MIN(MEDIUM_PTR_FOR_META_INDEX(region, range_idx) +
+		uintptr_t hi = MIN((uintptr_t)MEDIUM_PTR_FOR_META_INDEX(region, range_idx) +
 				MEDIUM_BYTES_FOR_MSIZE(range_msz), safe_end_ptr);
 
 		// The page that contains the freelist entry needs to be marked as not
-		// having been madvised.
+		// having been madvised. Note that the quantum is larger than the kernel page size
+		// so if safe_start_ptr and rangep are on different pages, we just mark
+		// the whole block as clean.
 		if (range_idx < MEDIUM_META_INDEX_FOR_PTR(safe_start_ptr)) {
 			medium_madvise_header_mark_dirty(madvh, range_idx,
 					MEDIUM_META_INDEX_FOR_PTR(safe_start_ptr) - range_idx);
 		}
 		if (range_idx + range_msz > MEDIUM_META_INDEX_FOR_PTR(safe_end_ptr)) {
 			medium_madvise_header_mark_dirty(madvh,
-					MEDIUM_META_INDEX_FOR_PTR(safe_end_ptr) + 1, range_idx + 
+					MEDIUM_META_INDEX_FOR_PTR(safe_end_ptr), range_idx +
 					range_msz - MEDIUM_META_INDEX_FOR_PTR(safe_end_ptr));
 		}
 
@@ -1269,10 +1282,12 @@ medium_madvise_free_range_conditional_no_lock(rack_t *rack, magazine_t *mag_ptr,
 		// We chose not to madvise, we need to re-mark the region as dirty
 		// for when we come back to it later.
 		if (left_dirty_msz < left_msz) {
+			/* The preceding block was clean. */
 			medium_madvise_header_mark_clean(madvh, range_idx,
 					left_msz - left_dirty_msz);
 		}
 		if (right_dirty_msz < right_msz) {
+			/* The trailing block was clean. */
 			medium_madvise_header_mark_clean(madvh, right_start_idx +
 					right_dirty_msz, right_msz - right_dirty_msz);
 		}
@@ -1359,24 +1374,10 @@ medium_free_try_depot_unmap_no_lock(rack_t *rack, magazine_t *depot_ptr, region_
 	int objects_in_use = medium_free_detach_region(rack, depot_ptr, sparse_region);
 
 	if (0 == objects_in_use) {
-		// Invalidate the hash table entry for this region with HASHRING_REGION_DEALLOCATED.
-		// Using HASHRING_REGION_DEALLOCATED preserves the collision chain, using HASHRING_OPEN_ENTRY (0) would not.
-		rgnhdl_t pSlot = hash_lookup_region_no_lock(rack->region_generation->hashed_regions,
-													rack->region_generation->num_regions_allocated,
-													rack->region_generation->num_regions_allocated_shift,
-													sparse_region);
-		if (NULL == pSlot) {
-			malloc_zone_error(rack->debug_flags, true, "medium_free_try_depot_unmap_no_lock hash lookup failed: %p\n", sparse_region);
+		if (!rack_region_remove(rack, sparse_region, node)) {
 			return NULL;
 		}
-		*pSlot = HASHRING_REGION_DEALLOCATED;
 		depot_ptr->num_bytes_in_magazine -= MEDIUM_REGION_PAYLOAD_BYTES;
-		// Atomically increment num_regions_dealloc
-#ifdef __LP64___
-		OSAtomicIncrement64(&rack->num_regions_dealloc);
-#else
-		OSAtomicIncrement32((int32_t *)&rack->num_regions_dealloc);
-#endif
 
 		// Caller will transfer ownership of the region back to the OS with no locks held
 		MAGMALLOC_DEALLOCREGION(MEDIUM_SZONE_FROM_RACK(rack), (void *)sparse_region, (int)MEDIUM_REGION_SIZE); // DTrace USDT Probe
@@ -1448,16 +1449,20 @@ medium_free_do_recirc_to_depot(rack_t *rack, magazine_t *medium_mag_ptr, mag_ind
 	MAGMALLOC_RECIRCREGION(MEDIUM_SZONE_FROM_RACK(rack), (int)mag_index, (void *)sparse_region, MEDIUM_REGION_SIZE,
 						   (int)BYTES_USED_FOR_MEDIUM_REGION(sparse_region)); // DTrace USDT Probe
 
-#if !CONFIG_AGGRESSIVE_MADVISE
-	// Mark free'd dirty pages with MADV_FREE to reduce memory pressure
-	medium_free_scan_madvise_free(rack, depot_ptr, sparse_region);
+#if CONFIG_AGGRESSIVE_MADVISE
+	if (!aggressive_madvise_enabled)
 #endif
+	{
+		// Mark free'd dirty pages with MADV_FREE to reduce memory pressure
+		medium_free_scan_madvise_free(rack, depot_ptr, sparse_region);
+	}
 
 	// If the region is entirely empty vm_deallocate() it outside the depot lock
 	region_t r_dealloc = medium_free_try_depot_unmap_no_lock(rack, depot_ptr, node);
 	SZONE_MAGAZINE_PTR_UNLOCK(depot_ptr);
 	if (r_dealloc) {
-		mvm_deallocate_pages(r_dealloc, MEDIUM_REGION_SIZE, 0);
+		mvm_deallocate_pages(r_dealloc, MEDIUM_REGION_SIZE,
+				MALLOC_FIX_GUARD_PAGE_FLAGS(rack->debug_flags));
 	}
 	return FALSE; // Caller need not unlock the originating magazine
 }
@@ -1502,12 +1507,15 @@ medium_free_try_recirc_to_depot(rack_t *rack,
 		}
 
 	} else {
-#if !CONFIG_AGGRESSIVE_MADVISE
-		// We are free'ing into the depot, so madvise as we do so unless we were madvising every incoming
-		// allocation anyway.
-		medium_madvise_free_range_no_lock(rack, medium_mag_ptr,
-				vm_kernel_page_size, region, freee, msize, headptr, headsize);
+#if CONFIG_AGGRESSIVE_MADVISE
+		if (!aggressive_madvise_enabled)
 #endif
+		{
+			// We are free'ing into the depot, so madvise as we do so unless we were madvising every incoming
+			// allocation anyway.
+			medium_madvise_free_range_no_lock(rack, medium_mag_ptr,
+					vm_kernel_page_size, region, freee, msize, headptr, headsize);
+		}
 
 		if (0 < bytes_used || 0 < node->pinned_to_depot) {
 			/* Depot'd region is still live. Leave it in place on the Depot's recirculation list
@@ -1518,7 +1526,7 @@ medium_free_try_recirc_to_depot(rack_t *rack,
 			region_t r_dealloc = medium_free_try_depot_unmap_no_lock(rack, medium_mag_ptr, node);
 			SZONE_MAGAZINE_PTR_UNLOCK(medium_mag_ptr);
 			if (r_dealloc) {
-				mvm_deallocate_pages(r_dealloc, MEDIUM_REGION_SIZE, 0);
+				mvm_deallocate_pages(r_dealloc, MEDIUM_REGION_SIZE, MALLOC_FIX_GUARD_PAGE_FLAGS(rack->debug_flags));
 			}
 			return FALSE; // Caller need not unlock
 		}
@@ -1533,14 +1541,12 @@ medium_free_no_lock(rack_t *rack, magazine_t *medium_mag_ptr, mag_index_t mag_in
 	msize_t *meta_headers = MEDIUM_META_HEADER_FOR_PTR(ptr);
 	unsigned index = MEDIUM_META_INDEX_FOR_PTR(ptr);
 	size_t original_size = MEDIUM_BYTES_FOR_MSIZE(msize);
-	unsigned char *next_block = ((unsigned char *)ptr + original_size);
+	void *next_block = ptr + original_size;
 	msize_t next_index = index + msize;
 
 	MALLOC_TRACE(TRACE_medium_free, (uintptr_t)rack, (uintptr_t)medium_mag_ptr, (uintptr_t)ptr, MEDIUM_BYTES_FOR_MSIZE(msize));
 
-#if CONFIG_AGGRESSIVE_MADVISE || CONFIG_RECIRC_DEPOT
 	void *original_ptr = ptr;
-#endif
 
 #if DEBUG_MALLOC
 	if (!msize) {
@@ -1554,6 +1560,9 @@ medium_free_no_lock(rack_t *rack, magazine_t *medium_mag_ptr, mag_index_t mag_in
 				ptr, msize);
 	}
 #endif
+
+	// Check that the region cookie is intact.
+	region_check_cookie(region, &REGION_COOKIE_FOR_MEDIUM_REGION(region));
 
 	// We try to coalesce this block with the preceeding one
 	if (index > 0 && (meta_headers[index - 1] & MEDIUM_IS_FREE)) {
@@ -1576,7 +1585,7 @@ medium_free_no_lock(rack_t *rack, magazine_t *medium_mag_ptr, mag_index_t mag_in
 	}
 
 	// Try to coalesce with this block with the next block
-	if ((next_block < MEDIUM_REGION_END(region)) && (meta_headers[next_index] & MEDIUM_IS_FREE)) {
+	if ((next_block < MEDIUM_REGION_HEAP_END(region)) && (meta_headers[next_index] & MEDIUM_IS_FREE)) {
 		msize_t next_msize = meta_headers[next_index] & ~MEDIUM_IS_FREE;
 		free_list_t next = medium_free_list_find_by_ptr(rack, medium_mag_ptr, next_block, next_msize);
 		medium_free_list_remove_ptr(rack, medium_mag_ptr, next, next_msize);
@@ -1598,15 +1607,24 @@ medium_free_no_lock(rack_t *rack, magazine_t *medium_mag_ptr, mag_index_t mag_in
 	medium_mag_ptr->mag_num_objects--;
 
 	// Update this region's bytes in use count
-	region_trailer_t *node = REGION_TRAILER_FOR_MEDIUM_REGION(region);
-	size_t bytes_used = node->bytes_used - original_size;
-	node->bytes_used = (unsigned int)bytes_used;
+	region_trailer_t *trailer = REGION_TRAILER_FOR_MEDIUM_REGION(region);
+	size_t bytes_used = trailer->bytes_used - original_size;
+	trailer->bytes_used = (unsigned int)bytes_used;
 
-	// Always attempt to madvise free regions that exceed the conditional
-	// madvise limit size.
-	medium_madvise_free_range_conditional_no_lock(rack, medium_mag_ptr,
-			medium_sliding_madvise_granularity(medium_mag_ptr), region, &freee,
-			msize, original_ptr, original_size);
+#if CONFIG_AGGRESSIVE_MADVISE
+	if (aggressive_madvise_enabled) {
+		medium_madvise_free_range_no_lock(rack, medium_mag_ptr,
+				vm_kernel_page_size, region, freee, msize, original_ptr, original_size);
+	}
+	else
+#endif
+	{
+		// Always attempt to madvise free regions that exceed the conditional
+		// madvise limit size.
+		medium_madvise_free_range_conditional_no_lock(rack, medium_mag_ptr,
+				medium_sliding_madvise_granularity(medium_mag_ptr), region, &freee,
+				msize, original_ptr, original_size);
+	}
 
 	// Caller must do SZONE_MAGAZINE_PTR_UNLOCK(tiny_mag_ptr) if this function
 	// returns TRUE.
@@ -1634,16 +1652,18 @@ medium_malloc_from_region_no_lock(rack_t *rack,
 		medium_finalize_region(rack, medium_mag_ptr);
 	}
 
+	medium_region_t region = (medium_region_t)aligned_address;
+
 	// Tag the region at "aligned_address" as belonging to us,
 	// and so put it under the protection of the magazine lock we are holding.
 	// Do this before advertising "aligned_address" on the hash ring(!)
-	MAGAZINE_INDEX_FOR_MEDIUM_REGION(aligned_address) = mag_index;
+	MAGAZINE_INDEX_FOR_MEDIUM_REGION(region) = mag_index;
 
 	// Insert the new region into the hash ring
-	rack_region_insert(rack, (region_t)aligned_address);
+	rack_region_insert(rack, region);
 
-	medium_mag_ptr->mag_last_region = aligned_address;
-	BYTES_USED_FOR_MEDIUM_REGION(aligned_address) = MEDIUM_BYTES_FOR_MSIZE(msize);
+	medium_mag_ptr->mag_last_region = region;
+	BYTES_USED_FOR_MEDIUM_REGION(region) = MEDIUM_BYTES_FOR_MSIZE(msize);
 
 #if CONFIG_ASLR_INTERNAL
 	int offset_msize = malloc_entropy[1] & MEDIUM_ENTROPY_MASK;
@@ -1652,13 +1672,13 @@ medium_malloc_from_region_no_lock(rack_t *rack,
 		offset_msize = strtol(getenv("MallocASLRForce"), NULL, 0) & MEDIUM_ENTROPY_MASK;
 	}
 	if (getenv("MallocASLRPrint")) {
-		malloc_report(ASL_LEVEL_INFO, "Region: %p offset: %d\n", aligned_address, offset_msize);
+		malloc_report(ASL_LEVEL_INFO, "Region: %p offset: %d\n", region, offset_msize);
 	}
 #endif
 #else
 	int offset_msize = 0;
 #endif
-	ptr = (void *)((uintptr_t)aligned_address +
+	ptr = (void *)(MEDIUM_REGION_HEAP_BASE(region) +
 			MEDIUM_BYTES_FOR_MSIZE(offset_msize));
 	medium_meta_header_set_in_use(MEDIUM_META_HEADER_FOR_PTR(ptr),
 			offset_msize, msize);
@@ -1694,7 +1714,7 @@ medium_malloc_from_region_no_lock(rack_t *rack,
 
 	// connect to magazine as last node
 	recirc_list_splice_last(rack, medium_mag_ptr,
-			REGION_TRAILER_FOR_MEDIUM_REGION(aligned_address));
+			REGION_TRAILER_FOR_MEDIUM_REGION(region));
 
 	return ptr;
 }
@@ -1760,7 +1780,8 @@ boolean_t
 medium_claimed_address(rack_t *rack, void *ptr)
 {
 	region_t r = medium_region_for_ptr_no_lock(rack, ptr);
-	return r && ptr < (void *)MEDIUM_REGION_END(r);
+	return r && ptr >= MEDIUM_REGION_HEAP_BASE(r)
+			&& ptr < MEDIUM_REGION_HEAP_END(r);
 }
 
 void *
@@ -1870,7 +1891,7 @@ medium_try_realloc_in_place(rack_t *rack, void *ptr, size_t old_size, size_t new
 		 * Try to expand into unused space immediately after this block.
 		 */
 		msize_t unused_msize = MEDIUM_MSIZE_FOR_BYTES(medium_mag_ptr->mag_bytes_free_at_end);
-		void *unused_start = MEDIUM_REGION_END(MEDIUM_REGION_FOR_PTR(ptr)) - medium_mag_ptr->mag_bytes_free_at_end;
+		void *unused_start = MEDIUM_REGION_HEAP_END(MEDIUM_REGION_FOR_PTR(ptr)) - medium_mag_ptr->mag_bytes_free_at_end;
 		if (medium_mag_ptr->mag_last_region == MEDIUM_REGION_FOR_PTR(ptr)
 				&& coalesced_msize < unused_msize && unused_start == ptr + old_size) {
 			// Extend the in-use for this block to the new size
@@ -1916,6 +1937,12 @@ medium_try_realloc_in_place(rack_t *rack, void *ptr, size_t old_size, size_t new
 				/* there's some left, so put the remainder back */
 				leftover = (unsigned char *)ptr + MEDIUM_BYTES_FOR_MSIZE(new_msize);
 				medium_free_list_add_ptr(rack, medium_mag_ptr, leftover, leftover_msize);
+				msize_t leftover_index = MEDIUM_META_INDEX_FOR_PTR(leftover);
+				if (madv_headers[leftover_index] & MEDIUM_IS_ADVISED) {
+					medium_madvise_header_mark_clean(madv_headers, leftover_index, leftover_msize);
+				} else {
+					medium_madvise_header_mark_dirty(madv_headers, leftover_index, leftover_msize);
+				}
 			}
 			medium_meta_header_set_in_use(meta_headers, index, new_msize);
 			medium_madvise_header_mark_dirty(madv_headers, index, new_msize);
@@ -1964,9 +1991,9 @@ boolean_t
 medium_check_region(rack_t *rack, region_t region, size_t region_index,
 		unsigned counter)
 {
-	unsigned char *ptr = MEDIUM_REGION_ADDRESS(region);
+	void *ptr = MEDIUM_REGION_HEAP_BASE(region);
 	msize_t *meta_headers = MEDIUM_META_HEADER_FOR_PTR(ptr);
-	unsigned char *region_end = MEDIUM_REGION_END(region);
+	void *region_end = MEDIUM_REGION_HEAP_END(region);
 	msize_t prev_free = 0;
 	unsigned index;
 	msize_t msize_and_free;
@@ -2038,9 +2065,10 @@ medium_check_region(rack_t *rack, region_t region, size_t region_index,
 				return 0;
 			}
 			if (MEDIUM_PREVIOUS_MSIZE(follower) != msize) {
-				MEDIUM_CHECK_FAIL("*** invariant broken for medium free %p followed by %p in region [%p-%p] "
+				MEDIUM_CHECK_FAIL("*** invariant broken for medium free %p followed by %p in region %p [%p-%p] "
 						"(end marker incorrect) should be %d; in fact %d\n",
-						ptr, follower, MEDIUM_REGION_ADDRESS(region), region_end, msize, MEDIUM_PREVIOUS_MSIZE(follower));
+						ptr, follower, region, MEDIUM_REGION_HEAP_BASE(region),
+						region_end, msize, MEDIUM_PREVIOUS_MSIZE(follower));
 				return 0;
 			}
 			ptr = (unsigned char *)follower;
@@ -2100,20 +2128,21 @@ medium_in_use_enumerator(task_t task,
 	for (index = 0; index < num_regions; ++index) {
 		region = regions[index];
 		if (HASHRING_OPEN_ENTRY != region && HASHRING_REGION_DEALLOCATED != region) {
-			range.address = (vm_address_t)MEDIUM_REGION_ADDRESS(region);
-			range.size = MEDIUM_REGION_SIZE;
+			range.address = (vm_address_t)MEDIUM_REGION_HEAP_BASE(region);
+			range.size = MEDIUM_HEAP_SIZE;
 			if (type_mask & MALLOC_ADMIN_REGION_RANGE_TYPE) {
-				admin_range.address = range.address + MEDIUM_METADATA_START;
+				admin_range.address = MEDIUM_REGION_METADATA(region);
 				admin_range.size = MEDIUM_METADATA_SIZE;
 				recorder(task, context, MALLOC_ADMIN_REGION_RANGE_TYPE, &admin_range, 1);
 			}
 			if (type_mask & (MALLOC_PTR_REGION_RANGE_TYPE | MALLOC_ADMIN_REGION_RANGE_TYPE)) {
 				ptr_range.address = range.address;
-				ptr_range.size = NUM_MEDIUM_BLOCKS * MEDIUM_QUANTUM;
+				ptr_range.size = MEDIUM_HEAP_SIZE;
 				recorder(task, context, MALLOC_PTR_REGION_RANGE_TYPE, &ptr_range, 1);
 			}
 			if (type_mask & MALLOC_PTR_IN_USE_RANGE_TYPE) {
-				err = reader(task, range.address, range.size, (void **)&mapped_region);
+				err = reader(task, (vm_address_t)region,
+						(vm_size_t)MEDIUM_REGION_SIZE, (void **)&mapped_region);
 				if (err) {
 					return err;
 				}
@@ -2126,13 +2155,13 @@ medium_in_use_enumerator(task_t task,
 				// Each magazine could have a pointer to a cached free block from
 				// this region. Count the regions that have such a pointer.
 				for (mag_index = 0; mag_index < szone->medium_rack.num_magazines; mag_index++) {
-					if ((void *)range.address == (medium_mag_base + mag_index)->mag_last_free_rgn) {
+					if (region == (medium_mag_base + mag_index)->mag_last_free_rgn) {
 						cached_free_blocks++;
 					}
 				}
 #endif // CONFIG_MEDIUM_CACHE
 
-				block_header = (msize_t *)(mapped_region + MEDIUM_METADATA_START + sizeof(region_trailer_t));
+				block_header = MEDIUM_META_HEADER_FOR_REGION(mapped_region);
 				block_index = 0;
 				block_limit = NUM_MEDIUM_BLOCKS;
 				if (region == medium_mag_ptr->mag_last_region) {
@@ -2146,7 +2175,7 @@ medium_in_use_enumerator(task_t task,
 						return KERN_FAILURE; // Somethings amiss. Avoid looping at this block_index.
 					}
 					if (!(msize_and_free & MEDIUM_IS_FREE)) {
-						vm_address_t ptr = range.address + MEDIUM_BYTES_FOR_MSIZE(block_index);
+						void *ptr = MEDIUM_REGION_HEAP_BASE(region) + MEDIUM_BYTES_FOR_MSIZE(block_index);
 #if CONFIG_MEDIUM_CACHE
 						// If there are still magazines that have cached free
 						// blocks in this region, check whether this is one of
@@ -2154,7 +2183,7 @@ medium_in_use_enumerator(task_t task,
 						boolean_t block_cached = false;
 						if (cached_free_blocks) {
 							for (mag_index = 0; mag_index < szone->medium_rack.num_magazines; mag_index++) {
-								if ((void *)ptr == (medium_mag_base + mag_index)->mag_last_free) {
+								if (ptr == (medium_mag_base + mag_index)->mag_last_free) {
 									block_cached = true;
 									cached_free_blocks--;
 									break;
@@ -2166,7 +2195,7 @@ medium_in_use_enumerator(task_t task,
 						}
 #endif // CONFIG_MEDIUM_CACHE
 						// Block in use
-						buffer[count].address = ptr;
+						buffer[count].address = (vm_address_t)ptr;
 						buffer[count].size = MEDIUM_BYTES_FOR_MSIZE(msize);
 						count++;
 						if (count >= MAX_RECORDER_BUFFER) {
@@ -2254,7 +2283,7 @@ medium_malloc_from_free_list(rack_t *rack, magazine_t *medium_mag_ptr, mag_index
 try_medium_from_end:
 	// Let's see if we can use medium_mag_ptr->mag_bytes_free_at_end
 	if (medium_mag_ptr->mag_bytes_free_at_end >= MEDIUM_BYTES_FOR_MSIZE(msize)) {
-		ptr = MEDIUM_REGION_END(medium_mag_ptr->mag_last_region) -
+		ptr = MEDIUM_REGION_HEAP_END(medium_mag_ptr->mag_last_region) -
 			medium_mag_ptr->mag_bytes_free_at_end;
 		medium_mag_ptr->mag_bytes_free_at_end -= MEDIUM_BYTES_FOR_MSIZE(msize);
 		if (medium_mag_ptr->mag_bytes_free_at_end) {
@@ -2315,10 +2344,13 @@ return_medium_alloc:
 	medium_mag_ptr->mag_num_objects++;
 	medium_mag_ptr->mag_num_bytes_in_objects += MEDIUM_BYTES_FOR_MSIZE(this_msize);
 
-	// Update this region's bytes in use count
-	region_trailer_t *node = REGION_TRAILER_FOR_MEDIUM_REGION(MEDIUM_REGION_FOR_PTR(ptr));
-	size_t bytes_used = node->bytes_used + MEDIUM_BYTES_FOR_MSIZE(this_msize);
-	node->bytes_used = (unsigned int)bytes_used;
+	// Check that the region cookie is intact and update the region's bytes in use count
+	medium_region_t region = MEDIUM_REGION_FOR_PTR(ptr);
+	region_check_cookie(region, &REGION_COOKIE_FOR_MEDIUM_REGION(region));
+
+	region_trailer_t *trailer = REGION_TRAILER_FOR_MEDIUM_REGION(region);
+	size_t bytes_used = trailer->bytes_used + MEDIUM_BYTES_FOR_MSIZE(this_msize);
+	trailer->bytes_used = (unsigned int)bytes_used;
 
 	// Emptiness discriminant
 	if (bytes_used < DENSITY_THRESHOLD(MEDIUM_REGION_PAYLOAD_BYTES)) {
@@ -2327,7 +2359,7 @@ return_medium_alloc:
 	} else {
 		/* Region has crossed threshold from sparsity to density. Mark in not "suitable" on the
 		 * recirculation candidates list. */
-		node->recirc_suitable = FALSE;
+		trailer->recirc_suitable = FALSE;
 	}
 #if DEBUG_MALLOC
 	if (LOG(szone, ptr)) {
@@ -2405,9 +2437,10 @@ medium_malloc_should_clear(rack_t *rack, msize_t msize, boolean_t cleared_reques
 			medium_mag_ptr->alloc_underway = TRUE;
 			OSMemoryBarrier();
 			SZONE_MAGAZINE_PTR_UNLOCK(medium_mag_ptr);
-			fresh_region = mvm_allocate_pages_securely(MEDIUM_REGION_SIZE,
-					MEDIUM_BLOCKS_ALIGN, VM_MEMORY_MALLOC_MEDIUM, 
-					rack->debug_flags);
+			fresh_region = mvm_allocate_pages(MEDIUM_REGION_SIZE,
+					MEDIUM_BLOCKS_ALIGN,
+					MALLOC_FIX_GUARD_PAGE_FLAGS(rack->debug_flags),
+					VM_MEMORY_MALLOC_MEDIUM);
 			SZONE_MAGAZINE_PTR_LOCK(medium_mag_ptr);
 
 			// DTrace USDT Probe
@@ -2421,6 +2454,7 @@ medium_malloc_should_clear(rack_t *rack, msize_t msize, boolean_t cleared_reques
 				return NULL;
 			}
 
+			region_set_cookie(&REGION_COOKIE_FOR_MEDIUM_REGION(fresh_region));
 			ptr = medium_malloc_from_region_no_lock(rack, medium_mag_ptr,
 					mag_index, msize, fresh_region);
 
@@ -2479,9 +2513,6 @@ medium_size(rack_t *rack, const void *ptr)
 static MALLOC_NOINLINE void
 free_medium_botch(rack_t *rack, void *ptr)
 {
-	mag_index_t mag_index = MAGAZINE_INDEX_FOR_MEDIUM_REGION(MEDIUM_REGION_FOR_PTR(ptr));
-	magazine_t *medium_mag_ptr = &(rack->magazines[mag_index]);
-	SZONE_MAGAZINE_PTR_UNLOCK(medium_mag_ptr);
 	malloc_zone_error(rack->debug_flags, true, "double free for ptr %p\n", ptr);
 }
 
@@ -2514,6 +2545,7 @@ free_medium(rack_t *rack, void *ptr, region_t medium_region, size_t known_size)
 
 		/* check that we don't already have this pointer in the cache */
 		if (ptr == ptr2) {
+			SZONE_MAGAZINE_PTR_UNLOCK(medium_mag_ptr);
 			free_medium_botch(rack, ptr);
 			return;
 		}
@@ -2635,9 +2667,9 @@ print_medium_region(task_t task, memory_reader_t reader,
 {
 	unsigned counts[1024];
 	unsigned in_use = 0;
-	uintptr_t start = (uintptr_t)MEDIUM_REGION_ADDRESS(region);
+	uintptr_t start = (uintptr_t)MEDIUM_REGION_HEAP_BASE(region);
 	uintptr_t current = start + bytes_at_start;
-	uintptr_t limit = (uintptr_t)MEDIUM_REGION_END(region) - bytes_at_end;
+	uintptr_t limit = (uintptr_t)MEDIUM_REGION_HEAP_END(region) - bytes_at_end;
 	uintptr_t mapped_start;
 	msize_t msize_and_free;
 	msize_t msize;
@@ -2705,8 +2737,9 @@ print_medium_region(task_t task, memory_reader_t reader,
 	}
 	if ((b = _simple_salloc()) != NULL) {
 		mag_index_t mag_index = MAGAZINE_INDEX_FOR_MEDIUM_REGION(mapped_region);
-		_simple_sprintf(b, "Medium region [%p-%p, %y] \t", (void *)start,
-				MEDIUM_REGION_END(region), (int)MEDIUM_REGION_SIZE);
+		_simple_sprintf(b, "Medium region %p [%p-%p, %y] \t", region,
+				(void *)start, MEDIUM_REGION_HEAP_END(region),
+				(int)MEDIUM_REGION_SIZE);
 		if (mag_index == DEPOT_MAGAZINE_INDEX) {
 			_simple_sprintf(b, "Recirc depot \t");
 		} else {
@@ -2773,8 +2806,9 @@ print_medium_region_vis(szone_t *szone, region_t region)
 	}
 
 	malloc_report(MALLOC_REPORT_NOLOG | MALLOC_REPORT_NOPREFIX,
-			"Medium region [%p-%p, %y, %y]\n", (void *)region,
-			MEDIUM_REGION_END(region), (int)MEDIUM_REGION_SIZE,
+			"Medium region %p  [%p-%p, %y, %y]\n", (void *)region,
+			MEDIUM_REGION_HEAP_BASE(region),
+			MEDIUM_REGION_HEAP_END(region), (int)MEDIUM_REGION_SIZE,
 			((medium_region_t)region)->trailer.bytes_used);
 
 	for (size_t x = 0; x < NUM_MEDIUM_BLOCKS; x++) {
