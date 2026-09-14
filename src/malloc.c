@@ -1885,6 +1885,91 @@ malloc_get_zone_name(malloc_zone_t *zone)
 }
 
 
+/*********	Typed allocation entry points	************/
+
+// Compilers targeting newer SDKs pass a type descriptor to every allocation (malloc_type_*),
+// which Apple's allocator uses to segregate allocations. Darling ignores the type and uses the
+// regular allocation paths.
+typedef unsigned long long malloc_type_id_t;
+
+MALLOC_EXPORT void *
+malloc_type_malloc(size_t size, malloc_type_id_t type_id)
+{
+	return malloc(size);
+}
+
+MALLOC_EXPORT void *
+malloc_type_calloc(size_t count, size_t size, malloc_type_id_t type_id)
+{
+	return calloc(count, size);
+}
+
+MALLOC_EXPORT void
+malloc_type_free(void *ptr, malloc_type_id_t type_id)
+{
+	free(ptr);
+}
+
+MALLOC_EXPORT void *
+malloc_type_realloc(void *ptr, size_t size, malloc_type_id_t type_id)
+{
+	return realloc(ptr, size);
+}
+
+MALLOC_EXPORT void *
+malloc_type_valloc(size_t size, malloc_type_id_t type_id)
+{
+	return valloc(size);
+}
+
+MALLOC_EXPORT void *
+malloc_type_aligned_alloc(size_t alignment, size_t size, malloc_type_id_t type_id)
+{
+	return aligned_alloc(alignment, size);
+}
+
+MALLOC_EXPORT int
+malloc_type_posix_memalign(void **memptr, size_t alignment, size_t size, malloc_type_id_t type_id)
+{
+	return posix_memalign(memptr, alignment, size);
+}
+
+MALLOC_EXPORT void *
+malloc_type_zone_malloc(malloc_zone_t *zone, size_t size, malloc_type_id_t type_id)
+{
+	return malloc_zone_malloc(zone, size);
+}
+
+MALLOC_EXPORT void *
+malloc_type_zone_calloc(malloc_zone_t *zone, size_t count, size_t size, malloc_type_id_t type_id)
+{
+	return malloc_zone_calloc(zone, count, size);
+}
+
+MALLOC_EXPORT void
+malloc_type_zone_free(malloc_zone_t *zone, void *ptr, malloc_type_id_t type_id)
+{
+	malloc_zone_free(zone, ptr);
+}
+
+MALLOC_EXPORT void *
+malloc_type_zone_realloc(malloc_zone_t *zone, void *ptr, size_t size, malloc_type_id_t type_id)
+{
+	return malloc_zone_realloc(zone, ptr, size);
+}
+
+MALLOC_EXPORT void *
+malloc_type_zone_valloc(malloc_zone_t *zone, size_t size, malloc_type_id_t type_id)
+{
+	return malloc_zone_valloc(zone, size);
+}
+
+MALLOC_EXPORT void *
+malloc_type_zone_memalign(malloc_zone_t *zone, size_t alignment, size_t size, malloc_type_id_t type_id)
+{
+	return malloc_zone_memalign(zone, alignment, size);
+}
+
 /*********	Generic ANSI callouts	************/
 
 void *
