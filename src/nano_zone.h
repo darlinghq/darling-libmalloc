@@ -33,7 +33,7 @@
 
 /*************          nanozone address field layout        ******************/
 
-#if defined(__x86_64)
+#if defined(__x86_64) || defined(__arm64__) || defined(__aarch64__)
 #define NANO_MAG_BITS			6
 #define NANO_BAND_BITS			17
 #define NANO_SLOT_BITS			4
