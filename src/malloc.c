@@ -1890,7 +1890,6 @@ malloc_get_zone_name(malloc_zone_t *zone)
 // Compilers targeting newer SDKs pass a type descriptor to every allocation (malloc_type_*),
 // which Apple's allocator uses to segregate allocations. Darling ignores the type and uses the
 // regular allocation paths.
-typedef unsigned long long malloc_type_id_t;
 
 MALLOC_EXPORT void *
 malloc_type_malloc(size_t size, malloc_type_id_t type_id)

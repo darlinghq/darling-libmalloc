@@ -34,6 +34,7 @@
 #include <sys/cdefs.h>
 #include <_types.h>
 #include <sys/_types/_size_t.h>
+#include <malloc/_malloc_type.h>
 
 __BEGIN_DECLS
 
