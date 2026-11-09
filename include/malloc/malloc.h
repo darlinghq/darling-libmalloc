@@ -115,6 +115,33 @@ extern void malloc_destroy_zone(malloc_zone_t *zone);
 extern void *malloc_zone_malloc(malloc_zone_t *zone, size_t size) __alloc_size(2);
     /* Allocates a new pointer of size size; zone must be non-NULL */
 
+/*
+ * Allocation options for malloc_zone_malloc_with_options().
+ * MALLOC_ZONE_MALLOC_OPTION_CLEAR zeroes the block. CANONICAL_TAG only
+ * matters with memory tagging and is accepted and ignored.
+ */
+typedef enum : uint64_t {
+	MALLOC_ZONE_MALLOC_OPTION_NONE = 0u,
+	MALLOC_ZONE_MALLOC_OPTION_CLEAR = 1u << 0,
+	MALLOC_ZONE_MALLOC_OPTION_CANONICAL_TAG = 1u << 1,
+} malloc_zone_malloc_options_t;
+
+/* Alignment that requests the default alignment from malloc_zone_malloc_with_options(). */
+#define MALLOC_ZONE_MALLOC_DEFAULT_ALIGN __SIZEOF_POINTER__
+
+extern void *malloc_zone_malloc_with_options(malloc_zone_t *zone, size_t align, size_t size, malloc_zone_malloc_options_t opts) __alloc_size(3) __API_AVAILABLE(macos(26.0), ios(26.0), tvos(26.0), watchos(26.0));
+    /*
+     * Allocates size bytes from zone (the default zone if NULL). align is
+     * MALLOC_ZONE_MALLOC_DEFAULT_ALIGN or a larger power of two; with a larger
+     * alignment, size must be a multiple of it. Returns NULL on failure and
+     * does not promise anything about errno.
+     */
+
+#if defined(__LP64__)
+extern void *malloc_type_zone_malloc_with_options(malloc_zone_t *zone, size_t alignment, size_t size, malloc_type_id_t type_id, malloc_zone_malloc_options_t opts) __result_use_check __alloc_size(3) __API_AVAILABLE(macos(26.0), ios(26.0), tvos(26.0), watchos(26.0));
+    /* Typed variant of malloc_zone_malloc_with_options(); see <malloc/_malloc_type.h>. */
+#endif
+
 extern void *malloc_zone_calloc(malloc_zone_t *zone, size_t num_items, size_t size) __alloc_size(2,3);
     /* Allocates a new pointer of size num_items * size; block is cleared; zone must be non-NULL */
 
