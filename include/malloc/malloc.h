@@ -28,6 +28,7 @@
 #include <mach/mach_types.h>
 #include <sys/cdefs.h>
 #include <Availability.h>
+#include <malloc/_malloc_type.h>
 
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
