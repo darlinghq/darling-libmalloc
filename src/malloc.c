@@ -2007,6 +2007,23 @@ malloc_type_zone_malloc_with_options(malloc_zone_t *zone, size_t alignment, size
 	return malloc_zone_malloc_with_options(zone, alignment, size, opts);
 }
 
+/*
+ * QUIRK: libsystem_malloc also exports malloc_type_zone_malloc_with_options_internal.
+ * It is declared in no SDK header; clients bind it by name. Its parameters
+ * are not documented. We give it those of malloc_type_zone_malloc_with_options
+ * and forward to it. Evidence: the symbol list of the macOS libsystem_malloc
+ * (nm metadata of the SDK .tbd), and black-box observation on macOS 26.7.3
+ * x86_64 that a call with the typed variant's argument list and results
+ * behaves as for the typed variant (tier 2, one call shape only).
+ * Test: malloc_type_internal.c (test_quirk_zone_malloc_with_options_internal)
+ */
+MALLOC_EXPORT void *
+malloc_type_zone_malloc_with_options_internal(malloc_zone_t *zone, size_t alignment, size_t size,
+		malloc_type_id_t type_id, malloc_zone_malloc_options_t opts)
+{
+	return malloc_type_zone_malloc_with_options(zone, alignment, size, type_id, opts);
+}
+
 /*********	Generic ANSI callouts	************/
 
 void *
